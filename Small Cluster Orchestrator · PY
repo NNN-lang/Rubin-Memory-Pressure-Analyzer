@@ -1,0 +1,570 @@
+"""
+small_cluster_orchestrator.py
+==============================
+Rubin Scalability Outside Hyperscale — NVL8 / Edge Cluster Optimizer.
+
+PROBLEM: Scalability Outside Hyperscale
+  Rubin NVL72 is designed for $300M+ AI factories.
+  But many real customers have:
+    • NVL8 nodes  (8 GPUs, 1 NVSwitch, no scale-out fabric)
+    • 2-4 DGX Rubin nodes  (16-32 GPUs, InfiniBand/Spectrum-6)
+    • On-premise clusters  (no photonic switches, limited bandwidth)
+    • Edge deployments  (Rubin CPX with GDDR7, 128 GB, no HBM4)
+
+  Challenges at this scale:
+    1. MoE expert parallelism across only 8 GPUs creates hotspots
+    2. KV cache doesn't fit in 288 GB per GPU for long-context requests
+    3. NVLink-C2C with Vera requires careful memory management without
+       the full 54 TB LPDDR5x of a rack
+    4. Power management: NVL8 nodes at 30-40% load = terrible FLOPS/W
+    5. Multi-tenant scheduling: multiple teams sharing one node
+
+  This module provides orchestration primitives for sub-hyperscale Rubin.
+"""
+
+from __future__ import annotations
+
+import time
+import math
+import logging
+import threading
+import json
+from dataclasses import dataclass, field, asdict
+from collections import defaultdict, deque
+from typing import Optional
+
+import numpy as np
+
+log = logging.getLogger("SmallClusterOrchestrator")
+
+
+# ─────────────────────────────────────────────
+#  Cluster Configuration
+# ─────────────────────────────────────────────
+
+@dataclass
+class RubinNodeConfig:
+    """
+    Describes a single Rubin node (DGX-style or HGX-style).
+    """
+    node_id: str
+    n_gpus: int                            # 2, 4, or 8 (NVL8)
+    gpu_type: str = "rubin_r200"           # or "rubin_cpx" (GDDR7, edge)
+    hbm4_gb_per_gpu: int = 288             # 128 for Rubin CPX
+    vera_lpddr_tb: float = 7.5            # per node (54 TB / 8 nodes = 6.75 TB/node)
+    nvlink_bw_tbs: float = 3.6
+    bf4_storage_tb: float = 8.0           # BlueField-4 NVMe SSD KV offload
+    interconnect: str = "nvlink6"         # "nvlink6", "infiniband800g", "ethernet400g"
+    interconnect_bw_gbs: float = 400.0    # inter-node bandwidth (GB/s)
+
+    @property
+    def total_hbm_gb(self) -> float:
+        return self.n_gpus * self.hbm4_gb_per_gpu
+
+    @property
+    def is_edge(self) -> bool:
+        return self.gpu_type == "rubin_cpx"
+
+
+@dataclass
+class ClusterConfig:
+    nodes: list[RubinNodeConfig]
+    scheduling_policy: str = "pack_first"  # "pack_first" | "spread" | "adaptive"
+    kv_offload_enabled: bool = True
+    multi_tenant: bool = False
+
+    @property
+    def total_gpus(self) -> int:
+        return sum(n.n_gpus for n in self.nodes)
+
+    @property
+    def total_hbm_gb(self) -> float:
+        return sum(n.total_hbm_gb for n in self.nodes)
+
+
+# ─────────────────────────────────────────────
+#  KV Cache Tiering for Small Clusters
+# ─────────────────────────────────────────────
+
+class SmallClusterKVTiering:
+    """
+    Multi-tier KV cache for Rubin nodes without full rack LPDDR5x.
+
+    Tier 0: HBM4 (hot, <2ms access)     — active sequences
+    Tier 1: Vera LPDDR5x via C2C (warm) — recent inactive sequences
+    Tier 2: BlueField-4 NVMe SSD        — cold KV, agentic contexts
+    Tier 3: CPU DRAM (x86 or Vera)      — spilled overflow
+
+    On NVL8:
+      288 GB × 8 = 2.3 TB HBM4 total
+      7.5 TB LPDDR5x (Vera CPU)          via 1.8 TB/s C2C
+      8 TB NVMe SSD (BlueField-4)        via PCIe 5 / DPU offload
+
+    For a 70B model at FP8:
+      Model weights: ~70 GB
+      Per-layer KV (128k ctx): ~4 GB / layer × 80 layers = 320 GB
+      → exceeds single-GPU HBM4 → tiering mandatory
+    """
+
+    TIER_LATENCY_MS = {
+        "hbm4": 0.002,       # 2µs
+        "vera_lpddr": 0.15,  # ~150µs via NVLink-C2C
+        "bf4_nvme": 1.5,     # ~1.5ms (PCIe 5 NVMe with DPU acceleration)
+        "cpu_dram": 0.3,     # ~300µs (fallback, x86 or Vera)
+    }
+
+    def __init__(self, node: RubinNodeConfig, model_weight_gb: float,
+                 context_len: int = 131072, n_layers: int = 80, kv_bytes_per_token: float = 1.0):
+        self.node = node
+        self.model_gb = model_weight_gb
+        self.ctx = context_len
+        self.n_layers = n_layers
+        self.kv_bytes = kv_bytes_per_token  # per token per layer in bytes
+
+        # Available capacity after model weights
+        self.hbm_avail = node.total_hbm_gb - model_weight_gb
+        self.lpddr_avail = node.vera_lpddr_tb * 1024       # GB
+        self.nvme_avail = node.bf4_storage_tb * 1024        # GB
+
+    def kv_size_gb(self, n_tokens: int) -> float:
+        return n_tokens * self.n_layers * self.kv_bytes / 1024.0
+
+    def plan(self, n_active_seqs: int, avg_ctx_len: int) -> dict:
+        """
+        Produce a KV tiering plan for the current workload.
+        Returns per-tier allocation and expected latency profile.
+        """
+        kv_per_seq = self.kv_size_gb(avg_ctx_len)
+        total_kv = kv_per_seq * n_active_seqs
+
+        # Allocate tiers greedily
+        hbm_kv = min(total_kv, self.hbm_avail * 0.75)        # leave 25% for activations
+        remaining = total_kv - hbm_kv
+        lpddr_kv = min(remaining, self.lpddr_avail * 0.80)
+        remaining -= lpddr_kv
+        nvme_kv = min(remaining, self.nvme_avail * 0.90)
+        remaining -= nvme_kv
+        overflow = max(0.0, remaining)
+
+        # Fraction of seqs by tier
+        total = max(total_kv, 0.001)
+        hbm_frac = hbm_kv / total
+        lpddr_frac = lpddr_kv / total
+        nvme_frac = nvme_kv / total
+
+        # Expected average token decode latency contribution from KV fetch
+        avg_latency_ms = (
+            hbm_frac * self.TIER_LATENCY_MS["hbm4"] +
+            lpddr_frac * self.TIER_LATENCY_MS["vera_lpddr"] +
+            nvme_frac * self.TIER_LATENCY_MS["bf4_nvme"]
+        )
+
+        # Max concurrent seqs per tier
+        seqs_in_hbm = int(hbm_kv / max(kv_per_seq, 0.001))
+        seqs_in_lpddr = int(lpddr_kv / max(kv_per_seq, 0.001))
+        seqs_in_nvme = int(nvme_kv / max(kv_per_seq, 0.001))
+
+        plan = {
+            "n_active_sequences": n_active_seqs,
+            "avg_context_len": avg_ctx_len,
+            "total_kv_gb": round(total_kv, 1),
+            "tiers": {
+                "hbm4_gb": round(hbm_kv, 1),
+                "vera_lpddr_gb": round(lpddr_kv, 1),
+                "bf4_nvme_gb": round(nvme_kv, 1),
+                "overflow_gb": round(overflow, 1),
+            },
+            "concurrent_sequences": {
+                "hbm_resident": seqs_in_hbm,
+                "lpddr_paged": seqs_in_lpddr,
+                "nvme_offloaded": seqs_in_nvme,
+            },
+            "estimated_avg_kv_latency_ms": round(avg_latency_ms, 3),
+            "bottleneck": (
+                "OVERFLOW — add nodes or reduce context"
+                if overflow > 0 else
+                "OK — all KV fits in memory hierarchy"
+            ),
+        }
+
+        if overflow > 0:
+            log.warning(
+                "KV overflow: %.1f GB doesn't fit in any tier. "
+                "Reduce n_active_seqs or enable aggressive KV compression.",
+                overflow)
+
+        return plan
+
+
+# ─────────────────────────────────────────────
+#  Multi-Tenant Scheduler (NVL8 multi-team)
+# ─────────────────────────────────────────────
+
+@dataclass
+class WorkloadRequest:
+    request_id: str
+    tenant_id: str
+    model_id: str
+    n_gpus_required: int
+    priority: int = 1          # 1 (low) to 5 (critical)
+    estimated_duration_s: float = 60.0
+    memory_gb: float = 100.0
+    submitted_at: float = field(default_factory=time.monotonic)
+
+
+class MultiTenantGpuScheduler:
+    """
+    Fair-share GPU scheduler for small Rubin clusters shared across teams.
+
+    Design: weighted fair-share with preemption hints.
+      - High-priority inference → low-latency slice on dedicated GPUs
+      - Training jobs → best-effort with time-sharing
+      - MoE models → prefer multi-GPU contiguous blocks (NVLink locality)
+
+    On NVL8: 8 GPUs, so granularity is 1-2-4-8 GPU blocks.
+    """
+
+    VALID_GPU_COUNTS = {1, 2, 4, 8, 16, 32, 64, 72}
+
+    def __init__(self, cluster: ClusterConfig):
+        self.cluster = cluster
+        self._gpu_allocations: dict[str, str] = {}  # gpu_id → tenant_id
+        self._queue: list[WorkloadRequest] = []
+        self._running: dict[str, WorkloadRequest] = {}  # request_id → request
+        self._lock = threading.Lock()
+        self._tenant_gpu_hours: defaultdict[str, float] = defaultdict(float)
+        self._n_free_gpus = cluster.total_gpus
+
+    def submit(self, req: WorkloadRequest) -> bool:
+        """Submit a workload. Returns True if immediately scheduled, False if queued."""
+        if req.n_gpus_required not in self.VALID_GPU_COUNTS:
+            # Snap to nearest valid block
+            req.n_gpus_required = min(self.VALID_GPU_COUNTS,
+                                      key=lambda x: abs(x - req.n_gpus_required))
+
+        with self._lock:
+            if self._n_free_gpus >= req.n_gpus_required:
+                self._schedule(req)
+                return True
+            else:
+                self._queue.append(req)
+                self._queue.sort(key=lambda r: (-r.priority, r.submitted_at))
+                log.info("Request %s queued (need %d GPUs, have %d free)",
+                         req.request_id, req.n_gpus_required, self._n_free_gpus)
+                return False
+
+    def complete(self, request_id: str) -> None:
+        """Mark a running job as complete and try to schedule queued jobs."""
+        with self._lock:
+            req = self._running.pop(request_id, None)
+            if req:
+                self._n_free_gpus += req.n_gpus_required
+                self._tenant_gpu_hours[req.tenant_id] += (
+                    req.n_gpus_required * req.estimated_duration_s / 3600)
+                log.info("Job %s complete. GPUs freed: %d. Free now: %d",
+                         request_id, req.n_gpus_required, self._n_free_gpus)
+                self._try_schedule_queue()
+
+    def _schedule(self, req: WorkloadRequest) -> None:
+        self._running[req.request_id] = req
+        self._n_free_gpus -= req.n_gpus_required
+        log.info("Scheduled %s (tenant=%s, GPUs=%d, pri=%d) | Free GPUs: %d",
+                 req.request_id, req.tenant_id,
+                 req.n_gpus_required, req.priority, self._n_free_gpus)
+
+    def _try_schedule_queue(self) -> None:
+        scheduled = []
+        for req in self._queue:
+            if self._n_free_gpus >= req.n_gpus_required:
+                self._schedule(req)
+                scheduled.append(req)
+        for r in scheduled:
+            self._queue.remove(r)
+
+    def utilization_report(self) -> dict:
+        with self._lock:
+            used = self.cluster.total_gpus - self._n_free_gpus
+            return {
+                "total_gpus": self.cluster.total_gpus,
+                "used_gpus": used,
+                "free_gpus": self._n_free_gpus,
+                "utilization_pct": round(used / max(self.cluster.total_gpus, 1) * 100, 1),
+                "queued_jobs": len(self._queue),
+                "running_jobs": len(self._running),
+                "tenant_gpu_hours": dict(self._tenant_gpu_hours),
+            }
+
+
+# ─────────────────────────────────────────────
+#  Adaptive Parallelism Planner
+# ─────────────────────────────────────────────
+
+class AdaptiveParallelismPlanner:
+    """
+    Given a model size and cluster size, recommends the optimal
+    tensor/pipeline/expert parallelism strategy for Rubin.
+
+    Key Rubin insight: NVLink 6 (3.6 TB/s) makes tensor parallelism
+    within an NVSwitch group nearly free. Pipeline parallelism across
+    nodes is bounded by inter-node bandwidth.
+
+    For NVL8: prefer TP=8, PP=1, no pipeline latency.
+    For 2× NVL8: prefer TP=8, PP=2, inter-node = IB 800G (100 GB/s).
+    """
+
+    @dataclass
+    class ParallelPlan:
+        tp: int    # tensor parallel
+        pp: int    # pipeline parallel
+        ep: int    # expert parallel (MoE)
+        dp: int    # data parallel
+        total_gpus: int
+        est_efficiency_pct: float
+        inter_node_bandwidth_gbs: float
+        notes: str
+
+    def plan(
+        self,
+        model_params_b: float,         # model parameters in billions
+        n_gpus: int,
+        n_nodes: int,
+        inter_node_bw_gbs: float,      # inter-node bandwidth GB/s
+        is_moe: bool = False,
+        n_experts: int = 64,
+        top_k: int = 2,
+        context_len: int = 4096,
+    ) -> "AdaptiveParallelismPlanner.ParallelPlan":
+
+        # Intra-node NVLink is always preferred for TP
+        # Rubin NVL8: 8 GPUs per node, all-to-all via NVSwitch 6
+        gpus_per_node = n_gpus // n_nodes
+
+        # Tensor parallel: limited to within-node NVLink group
+        tp = min(gpus_per_node, 8)  # max NVSwitch group = 8 on NVL8
+
+        # Pipeline parallel: across nodes
+        pp = n_nodes if n_nodes > 1 else 1
+
+        # Expert parallel: use remaining GPUs
+        ep = 1
+        if is_moe:
+            ep = min(n_gpus, n_experts)
+            # Scale TP down if EP is high — avoid over-partitioning
+            if ep > tp:
+                tp = max(1, tp // (ep // tp))
+
+        # Data parallel: remaining dimension
+        dp = max(1, n_gpus // (tp * pp))
+
+        # Estimate efficiency
+        # TP efficiency: nearly 100% intra-node, drops with cross-node
+        tp_eff = 0.95 if tp <= gpus_per_node else 0.75
+        # PP efficiency: bubble overhead ≈ (pp-1)/pp for ideal schedule
+        pp_bubble = (pp - 1) / pp if pp > 1 else 0.0
+        pp_eff = 1.0 - pp_bubble * 0.3   # 1F1B schedule reduces bubble
+        # EP efficiency: load imbalance in sparse MoE
+        ep_eff = 0.80 if is_moe else 1.0
+
+        overall_eff = tp_eff * pp_eff * ep_eff * 100
+
+        # Notes
+        notes_parts = []
+        if pp > 1:
+            # Check if inter-node BW is sufficient
+            # Activation size at TP split: ~(seq_len × hidden / tp) × 2 bytes
+            hidden = int(math.sqrt(model_params_b * 1e9 / 4))
+            act_gb = context_len * hidden / tp * 2 / 1e9
+            bw_need = act_gb * 2   # fwd + bwd
+            if bw_need > inter_node_bw_gbs * 0.5:
+                notes_parts.append(
+                    f"WARNING: pipeline activation size ~{bw_need:.1f} GB/s may saturate "
+                    f"inter-node link ({inter_node_bw_gbs} GB/s). Consider reducing TP or ctx.")
+        if is_moe and ep < n_experts:
+            notes_parts.append(
+                f"Expert parallelism limited to {ep} (< {n_experts} total experts). "
+                f"Some GPUs will host multiple experts — enable ExpertCoalescer.")
+        if not notes_parts:
+            notes_parts.append("Configuration looks optimal for Rubin NVL8/small cluster.")
+
+        return self.ParallelPlan(
+            tp=tp, pp=pp, ep=ep, dp=dp,
+            total_gpus=tp * pp * max(dp, 1),
+            est_efficiency_pct=round(overall_eff, 1),
+            inter_node_bandwidth_gbs=inter_node_bw_gbs,
+            notes=" | ".join(notes_parts),
+        )
+
+    def print_plan(self, model_name: str, **kwargs) -> None:
+        plan = self.plan(**kwargs)
+        print(f"\n  Parallelism plan for {model_name}:")
+        print(f"    TP={plan.tp} × PP={plan.pp} × EP={plan.ep} × DP={plan.dp}")
+        print(f"    Total GPUs used: {plan.total_gpus}")
+        print(f"    Estimated efficiency: {plan.est_efficiency_pct}%")
+        print(f"    Notes: {plan.notes}")
+
+
+# ─────────────────────────────────────────────
+#  Power-Aware Consolidation Scheduler
+# ─────────────────────────────────────────────
+
+class PowerAwareConsolidationScheduler:
+    """
+    At low utilization, consolidates workloads onto fewer nodes
+    and powers down idle Rubin nodes to save energy.
+
+    FLOPS/W degrades sharply below ~40% utilization on Rubin.
+    Better to run 2 fully-loaded nodes than 8 at 25% load.
+
+    Strategy:
+      - Monitor per-node GPU utilization
+      - If node utilization < threshold: migrate workloads, suspend node
+      - Wake suspended nodes when demand grows (NVLink fabric awareness)
+    """
+
+    SLEEP_THRESHOLD_PCT = 35.0     # below this → candidate for suspension
+    WAKE_THRESHOLD_PCT = 70.0      # above this → wake next node
+    NODE_STARTUP_S = 45.0          # Rubin node wake-from-sleep time (estimate)
+
+    def __init__(self, cluster: ClusterConfig):
+        self.cluster = cluster
+        self._node_state: dict[str, str] = {n.node_id: "ACTIVE" for n in cluster.nodes}
+        self._node_util: dict[str, float] = {n.node_id: 0.0 for n in cluster.nodes}
+        self._lock = threading.Lock()
+
+    def update_utilization(self, node_id: str, util_pct: float) -> None:
+        with self._lock:
+            self._node_util[node_id] = util_pct
+
+    def evaluate(self) -> list[dict]:
+        """Returns list of recommended actions."""
+        actions = []
+        with self._lock:
+            active_nodes = [n for n in self.cluster.nodes if self._node_state[n.node_id] == "ACTIVE"]
+            total_load = sum(self._node_util[n.node_id] for n in active_nodes)
+            avg_util = total_load / max(len(active_nodes), 1)
+
+            for node in self.cluster.nodes:
+                nid = node.node_id
+                state = self._node_state[nid]
+                util = self._node_util.get(nid, 0.0)
+
+                if state == "ACTIVE" and util < self.SLEEP_THRESHOLD_PCT and len(active_nodes) > 1:
+                    # Can we consolidate this node's workload elsewhere?
+                    head_room = sum(
+                        max(0, 90 - self._node_util[n.node_id])
+                        for n in active_nodes if n.node_id != nid
+                    )
+                    if head_room >= util:
+                        actions.append({
+                            "action": "SUSPEND_NODE",
+                            "node_id": nid,
+                            "current_util_pct": util,
+                            "reason": f"Low utilization ({util:.0f}%) — consolidate to other nodes",
+                            "estimated_power_saving_w": node.n_gpus * 220,  # idle power saved
+                        })
+                        self._node_state[nid] = "SUSPENDING"
+
+                elif state == "SUSPENDED" and avg_util > self.WAKE_THRESHOLD_PCT:
+                    actions.append({
+                        "action": "WAKE_NODE",
+                        "node_id": nid,
+                        "current_cluster_util_pct": avg_util,
+                        "reason": f"Cluster over {self.WAKE_THRESHOLD_PCT}% — need capacity",
+                        "startup_delay_s": self.NODE_STARTUP_S,
+                    })
+                    self._node_state[nid] = "WAKING"
+
+        return actions
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "nodes": [
+                    {
+                        "node_id": n.node_id,
+                        "state": self._node_state[n.node_id],
+                        "utilization_pct": round(self._node_util.get(n.node_id, 0.0), 1),
+                        "gpus": n.n_gpus,
+                    }
+                    for n in self.cluster.nodes
+                ],
+                "total_active_nodes": sum(
+                    1 for n in self.cluster.nodes if self._node_state[n.node_id] == "ACTIVE"),
+                "avg_utilization_pct": round(
+                    sum(self._node_util.values()) / max(len(self._node_util), 1), 1),
+            }
+
+
+# ─────────────────────────────────────────────
+#  Demo / Integration Test
+# ─────────────────────────────────────────────
+
+def demo():
+    print("\n" + "═" * 65)
+    print("  RUBIN SMALL CLUSTER ORCHESTRATOR — DEMO")
+    print("═" * 65)
+
+    # 1. Build a 2-node NVL8 cluster (16 GPUs total)
+    nodes = [
+        RubinNodeConfig(node_id="node-0", n_gpus=8, vera_lpddr_tb=7.5, bf4_storage_tb=8.0),
+        RubinNodeConfig(node_id="node-1", n_gpus=8, vera_lpddr_tb=7.5, bf4_storage_tb=8.0),
+    ]
+    cluster = ClusterConfig(nodes=nodes, multi_tenant=True)
+
+    # 2. KV Tiering Plan for a 70B model, 200 concurrent users, 16k context
+    print("\n[1] KV Cache Tiering Plan (70B model, 200 seqs, 16k context)")
+    tiering = SmallClusterKVTiering(nodes[0], model_weight_gb=70.0,
+                                     context_len=16384, n_layers=80,
+                                     kv_bytes_per_token=0.5)
+    plan = tiering.plan(n_active_seqs=200, avg_ctx_len=8192)
+    for k, v in plan.items():
+        print(f"   {k}: {v}")
+
+    # 3. Parallelism planning
+    print("\n[2] Optimal Parallelism Strategies")
+    planner = AdaptiveParallelismPlanner()
+    planner.print_plan(
+        "Mixtral 8×22B (MoE)", model_params_b=140, n_gpus=16, n_nodes=2,
+        inter_node_bw_gbs=100, is_moe=True, n_experts=8, top_k=2, context_len=4096)
+    planner.print_plan(
+        "Llama-3 70B (dense)", model_params_b=70, n_gpus=8, n_nodes=1,
+        inter_node_bw_gbs=400, is_moe=False, context_len=8192)
+
+    # 4. Multi-tenant scheduling
+    print("\n[3] Multi-Tenant Scheduler (2 teams, 1 cluster)")
+    sched = MultiTenantGpuScheduler(cluster)
+    jobs = [
+        WorkloadRequest("inf-001", "team_a", "llama70b", 4, priority=5, estimated_duration_s=3600),
+        WorkloadRequest("train-001", "team_b", "mixtral", 8, priority=2, estimated_duration_s=7200),
+        WorkloadRequest("inf-002", "team_a", "llama70b", 4, priority=4, estimated_duration_s=1800),
+        WorkloadRequest("train-002", "team_b", "custom", 8, priority=1, estimated_duration_s=3600),
+    ]
+    for job in jobs:
+        immediate = sched.submit(job)
+        status = "RUNNING" if immediate else "QUEUED"
+        print(f"   {job.request_id} (tenant={job.tenant_id}, GPUs={job.n_gpus_required}, "
+              f"pri={job.priority}) → {status}")
+
+    print(f"\n   Utilization: {json.dumps(sched.utilization_report(), indent=4)}")
+
+    # 5. Power-aware consolidation
+    print("\n[4] Power-Aware Node Consolidation")
+    cons = PowerAwareConsolidationScheduler(cluster)
+    cons.update_utilization("node-0", 75.0)
+    cons.update_utilization("node-1", 18.0)   # underloaded → suspend candidate
+    actions = cons.evaluate()
+    for action in actions:
+        print(f"   → {action['action']}: {action['node_id']} — {action.get('reason', '')}")
+        if "estimated_power_saving_w" in action:
+            print(f"     Power saving: {action['estimated_power_saving_w']} W")
+
+    print(f"\n   Cluster status: {json.dumps(cons.status(), indent=4)}")
+
+    print("\n" + "═" * 65 + "\n")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
+    demo()
+
+
