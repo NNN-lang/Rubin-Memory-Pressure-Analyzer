@@ -1,0 +1,115 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+import time
+import pytest
+
+from riee.latency_controller import LatencyController, LatencyObservation
+
+
+def make_obs(latency_ms: float, batch_size: int = 32) -> LatencyObservation:
+    return LatencyObservation(
+        timestamp=time.monotonic(),
+        latency_ms=latency_ms,
+        batch_size=batch_size,
+        num_tokens=batch_size * 512,
+    )
+
+
+class TestLatencyController:
+    def test_init_defaults(self):
+        ctrl = LatencyController(target_p95_ms=150.0)
+        assert ctrl.batch_window_ms > 0
+        assert ctrl.state.current_batch_window_ms > 0
+
+    def test_percentile_tracking(self):
+        ctrl = LatencyController(target_p95_ms=150.0, window_size=100)
+        # Feed 100 observations at fixed latency
+        for _ in range(100):
+            ctrl.record_observation(make_obs(100.0))
+        p50 = ctrl.get_percentile(0.50)
+        p95 = ctrl.get_percentile(0.95)
+        assert p50 is not None
+        assert p95 is not None
+        assert abs(p50 - 100.0) < 1.0
+        assert abs(p95 - 100.0) < 1.0
+
+    def test_violation_shrinks_window(self):
+        ctrl = LatencyController(
+            target_p95_ms=100.0,
+            window_size=20,
+            initial_batch_window_ms=20.0,
+        )
+        # Feed high-latency observations to trigger violations
+        for _ in range(20):
+            ctrl.record_observation(make_obs(200.0))
+        state_before = ctrl.state.current_batch_window_ms
+        ctrl.update()
+        assert ctrl.state.current_batch_window_ms <= state_before
+
+    def test_slack_grows_window(self):
+        ctrl = LatencyController(
+            target_p95_ms=200.0,
+            window_size=20,
+            initial_batch_window_ms=5.0,
+        )
+        # Feed low-latency observations (lots of slack)
+        for _ in range(20):
+            ctrl.record_observation(make_obs(50.0))
+        window_before = ctrl.state.current_batch_window_ms
+        ctrl.update()
+        assert ctrl.state.current_batch_window_ms >= window_before
+
+    def test_window_bounded(self):
+        ctrl = LatencyController(
+            target_p95_ms=200.0,
+            min_batch_window_ms=2.0,
+            max_batch_window_ms=30.0,
+            initial_batch_window_ms=5.0,
+        )
+        for _ in range(100):
+            ctrl.record_observation(make_obs(1.0))
+            ctrl.update()
+        assert ctrl.batch_window_ms <= 30.0
+
+        ctrl2 = LatencyController(
+            target_p95_ms=50.0,
+            min_batch_window_ms=2.0,
+            max_batch_window_ms=30.0,
+            initial_batch_window_ms=25.0,
+        )
+        for _ in range(100):
+            ctrl2.record_observation(make_obs(500.0))
+            ctrl2.update()
+        assert ctrl2.batch_window_ms >= 2.0
+
+    def test_reset_clears_state(self):
+        ctrl = LatencyController()
+        for _ in range(50):
+            ctrl.record_observation(make_obs(100.0))
+        ctrl.reset()
+        assert ctrl.get_percentile(0.95) is None
+
+    def test_aggressive_scale_down_on_streak(self):
+        ctrl = LatencyController(
+            target_p95_ms=50.0,
+            window_size=10,
+            initial_batch_window_ms=20.0,
+            violation_streak_threshold=3,
+        )
+        for _ in range(10):
+            ctrl.record_observation(make_obs(500.0))
+        # Trigger 3+ violation streak
+        for _ in range(5):
+            ctrl.update()
+        # Should have dropped significantly
+        assert ctrl.batch_window_ms < 15.0
+
+    def test_cross_gpu_flag_updates_fabric_pressure(self):
+        ctrl = LatencyController()
+        for _ in range(20):
+            obs = make_obs(80.0)
+            obs.cross_gpu = True
+            ctrl.record_observation(obs)
+        assert ctrl.state.fabric_pressure_score > 0.0
